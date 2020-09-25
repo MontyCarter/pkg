@@ -29,6 +29,7 @@ import (
 	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
+	"k8s.io/apimachinery/pkg/util/clock"
 )
 
 type storedViews struct {
@@ -40,6 +41,7 @@ type meterExporter struct {
 	m view.Meter    // NOTE: DO NOT RETURN THIS DIRECTLY; the view.Meter will not work for the empty Resource
 	o stats.Options // Cache the option to reduce allocations
 	e view.Exporter
+	t time.Time // Time when last access occurred
 }
 
 // ResourceExporterFactory provides a hook for producing separate view.Exporters
@@ -51,6 +53,8 @@ type meters struct {
 	meters  map[string]*meterExporter
 	factory ResourceExporterFactory
 	lock    sync.Mutex
+	clock   clock.Clock
+	ticker  clock.Ticker
 }
 
 // Lock regime: lock allMeters before resourceViews. The critical path is in
@@ -59,6 +63,36 @@ type meters struct {
 var resourceViews = storedViews{}
 var allMeters = meters{
 	meters: map[string]*meterExporter{"": &defaultMeter},
+	clock:  cleanupClock,
+}
+
+// Cleanup is initiated using cleanupOnce, which is called from
+var cleanupClock = clock.Clock(clock.RealClock{}) // Var needed to avoid allMeters->defaultMeter->allMeters.clock cycle
+var cleanupOnce sync.Once
+var meterExporterScanFrequency = 1 * time.Minute
+var maxMeterExporterAge = 10 * time.Minute
+
+func cleanup() {
+	expiryCutoff := allMeters.clock.Now().Add(-1 * maxMeterExporterAge)
+	for key, meter := range allMeters.meters {
+		if key != "" && meter.t.Before(expiryCutoff) {
+			flushGivenExporter(meter.e)
+			delete(allMeters.meters, key)
+		}
+	}
+}
+
+func startCleanup() {
+	allMeters.lock.Lock()
+	allMeters.ticker = allMeters.clock.NewTicker(meterExporterScanFrequency)
+	allMeters.lock.Unlock()
+	go func() {
+		for range allMeters.ticker.C() {
+			allMeters.lock.Lock()
+			defer allMeters.lock.Unlock()
+			cleanup()
+		}
+	}()
 }
 
 // RegisterResourceView is similar to view.Register(), except that it will
@@ -195,6 +229,7 @@ func meterExporterForResource(r *resource.Resource) *meterExporter {
 		mE = &meterExporter{}
 		allMeters.meters[key] = mE
 	}
+	mE.t = allMeters.clock.Now()
 	if mE.o != nil {
 		return mE
 	}
@@ -313,6 +348,7 @@ var _ view.Meter = (*defaultMeterImpl)(nil)
 var defaultMeter = meterExporter{
 	m: &defaultMeterImpl{},
 	o: stats.WithRecorder(nil),
+	t: cleanupClock.Now(),
 }
 
 func (*defaultMeterImpl) Record(*tag.Map, interface{}, map[string]interface{}) {

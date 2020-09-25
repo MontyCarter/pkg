@@ -37,6 +37,7 @@ import (
 	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
+	"k8s.io/apimachinery/pkg/util/clock"
 
 	emptypb "github.com/golang/protobuf/ptypes/empty"
 	"github.com/google/go-cmp/cmp"
@@ -142,6 +143,62 @@ func TestSetFactory(t *testing.T) {
 	if e.id != "456" {
 		t.Error("Expect id to be 456, instead got", e.id)
 	}
+}
+
+func TestAllMetersExpiration(t *testing.T) {
+	ClearMetersForTest()
+	allMeters.lock.Lock()
+	allMeters.clock = clock.Clock(clock.NewFakeClock(time.Now())) // t+0m
+	fakeClock := allMeters.clock.(*clock.FakeClock)
+	allMeters.lock.Unlock()
+	startCleanup()
+
+	// Add resource123
+	resource123 := r
+	resource123.Labels["id"] = "123"
+	_, err := optionForResource(&resource123)
+	if err != nil {
+		t.Errorf("Should succeed getting option, instead got error %v", err)
+	}
+	// (123=0m, 456=Inf)
+
+	// Bump time to make resource123's expiry offset from resource456
+	fakeClock.Step(90 * time.Second) // t+1.5m
+	// (123=0m, 456=Inf)
+
+	// Add 456
+	resource456 := r
+	resource456.Labels["id"] = "456"
+	_, err = optionForResource(&resource456)
+	if err != nil {
+		t.Errorf("Should succeed getting option, instead got error %v", err)
+	}
+	allMeters.lock.Lock()
+	if len(allMeters.meters) != 3 {
+		t.Errorf("3 meterExporters should exist, however %v found.", len(allMeters.meters))
+	}
+	allMeters.lock.Unlock()
+	// (123=1.5m, 456=0m)
+
+	// Warm up the older entry
+	fakeClock.Step(90 * time.Second) //t+3m
+	// (123=4.5m, 456=3m)
+
+	// Refresh the first entry
+	_, err = optionForResource(&resource123)
+	if err != nil {
+		t.Errorf("Should succeed getting option, instead got error %v", err)
+	}
+	// (123=0, 456=1.5m)
+
+	// Expire the second entry
+	fakeClock.Step(9 * time.Minute) // t+12m
+	time.Sleep(1 * time.Second)     // Wait a second on the wallclock, so that the cleanup thread has time to finish a loop
+	if len(allMeters.meters) != 2 {
+		t.Errorf("2 meterExporters should exist, however %v found.", len(allMeters.meters))
+	}
+	// (123=9m, 456=10.5m)
+	// non-expiring defaultMeter was just tested
 }
 
 func TestResourceAsString(t *testing.T) {

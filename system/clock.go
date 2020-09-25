@@ -20,13 +20,21 @@ import (
 	"time"
 )
 
-// Mockable interface for time based testing
+// Clock interface, mockable for time based testing
 type Clock interface {
 	Now() time.Time
+	Sleep(duration time.Duration)
 }
 
+// RealClock - a passthrough to time
 type RealClock struct{}
 
+// Now - returns the current time of the clock
 func (RealClock) Now() time.Time {
 	return time.Now()
+}
+
+// Sleep - Advances the clock by duration
+func (RealClock) Sleep(duration time.Duration) {
+	time.Sleep(duration)
 }
