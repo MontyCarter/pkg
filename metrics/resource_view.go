@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	cache "github.com/patrickmn/go-cache"
 	"go.opencensus.io/metric/metricdata"
 	"go.opencensus.io/resource"
 	"go.opencensus.io/stats"
@@ -48,7 +49,7 @@ type meterExporter struct {
 // Tags are.
 type ResourceExporterFactory func(*resource.Resource) (view.Exporter, error)
 type meters struct {
-	meters  map[string]*meterExporter
+	meters  cache.Cache // string -> *meterExporter
 	factory ResourceExporterFactory
 	lock    sync.Mutex
 }
@@ -58,7 +59,7 @@ type meters struct {
 // resourceViews if a new meter needs to be created.
 var resourceViews = storedViews{}
 var allMeters = meters{
-	meters: map[string]*meterExporter{"": &defaultMeter},
+	meters: cache.NewFrom(10*time.Minute, 30*time.Second, map[string]*meterExporter{"": &defaultMeter}),
 }
 
 // RegisterResourceView is similar to view.Register(), except that it will
@@ -70,7 +71,7 @@ func RegisterResourceView(views ...*view.View) error {
 	defer allMeters.lock.Unlock()
 	resourceViews.lock.Lock()
 	defer resourceViews.lock.Unlock()
-	for _, meter := range allMeters.meters {
+	for _, meter := range allMeters.meters.Itens() {
 		// make a copy of views to avoid data races
 		viewCopy := copyViews(views)
 		if e := meter.m.Register(viewCopy...); e != nil {
@@ -94,7 +95,7 @@ func UnregisterResourceView(views ...*view.View) {
 	resourceViews.lock.Lock()
 	defer resourceViews.lock.Unlock()
 
-	for _, meter := range allMeters.meters {
+	for _, meter := range allMeters.meters.Items() {
 		// Since we make a defensive copy of all views in RegisterResourceView,
 		// the caller might not have the same view pointer that was registered.
 		// Use Meter.Find() to find the view with a matching name.
@@ -138,7 +139,7 @@ func setFactory(f ResourceExporterFactory) error {
 
 	var retErr error
 
-	for r, meter := range allMeters.meters {
+	for r, meter := range allMeters.meters.Items() {
 		e, err := f(resourceFromKey(r))
 		if err != nil {
 			retErr = err
@@ -159,7 +160,7 @@ func setReportingPeriod(mc *metricsConfig) {
 	if mc != nil {
 		rp = mc.reportingPeriod
 	}
-	for _, meter := range allMeters.meters {
+	for _, meter := range allMeters.meters.Items() {
 		meter.m.SetReportingPeriod(rp)
 	}
 }
@@ -168,7 +169,7 @@ func flushResourceExporters() {
 	allMeters.lock.Lock()
 	defer allMeters.lock.Unlock()
 
-	for _, meter := range allMeters.meters {
+	for _, meter := range allMeters.meters.Items() {
 		flushGivenExporter(meter.e)
 	}
 }
