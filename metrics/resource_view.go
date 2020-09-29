@@ -71,7 +71,7 @@ func RegisterResourceView(views ...*view.View) error {
 	defer allMeters.lock.Unlock()
 	resourceViews.lock.Lock()
 	defer resourceViews.lock.Unlock()
-	for _, meter := range allMeters.meters.Itens() {
+	for _, meter := range allMeters.meters.Items() {
 		// make a copy of views to avoid data races
 		viewCopy := copyViews(views)
 		if e := meter.m.Register(viewCopy...); e != nil {

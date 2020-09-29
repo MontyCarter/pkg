@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -37,6 +38,7 @@ import (
 	"go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
+	"k8s.io/apimachinery/pkg/util/clock"
 
 	emptypb "github.com/golang/protobuf/ptypes/empty"
 	"github.com/google/go-cmp/cmp"
@@ -80,6 +82,102 @@ func TestRegisterResourceView(t *testing.T) {
 	if viewToFind == nil || viewToFind.Name != "testView" {
 		t.Errorf("Registered view should be found in new meter, instead got %v", viewToFind)
 	}
+}
+
+func printAllMeters(clock clock.Clock, fakeClock *clock.FakeClock) {
+	log.Printf("Print allMeters.meters (clock %v) (fakeClock %v):", clock.Now(), fakeClock.Now())
+	log.Printf("-----------------------")
+	allMeters.lock.Lock()
+	defer allMeters.lock.Unlock()
+	for k, v := range allMeters.meters {
+		log.Printf("Key: %v, time: %v, age: %v", k, v.t, clock.Since(v.t))
+	}
+}
+
+func TestAllMetersExpiration(t *testing.T) {
+	ClearMetersForTest()
+	origClock := allMeters.clock
+	allMeters.clock = clock.Clock(clock.NewFakeClock(time.Now())) // t+0m
+	fakeClock := allMeters.clock.(*clock.FakeClock)
+	startCleanup()
+	//log.Printf("start")
+	//printAllMeters(allMeters.clock, fakeClock)
+
+	// Add resource123
+	resource123 := r
+	resource123.Labels["id"] = "123"
+	_, err := optionForResource(&resource123)
+	if err != nil {
+		t.Errorf("Should succeed getting option, instead got error %v", err)
+	}
+	// (123=0m, 456=Inf)
+	//log.Printf("AddedResource123")
+	//printAllMeters(allMeters.clock, fakeClock)
+
+	// Bump time to make resource123's expiry offset from resource456
+	fakeClock.Step(90 * time.Second) // t+1.5m
+	//log.Printf("stepped90")
+	//printAllMeters(allMeters.clock, fakeClock)
+
+	// Add 456
+	resource456 := r
+	resource456.Labels["id"] = "456"
+	_, err = optionForResource(&resource456)
+	if err != nil {
+		t.Errorf("Should succeed getting option, instead got error %v", err)
+	}
+	// (123=1.5m, 456=0m)
+	//log.Printf("Added456")
+	//printAllMeters(allMeters.clock, fakeClock)
+	allMeters.lock.Lock()
+	if len(allMeters.meters) != 3 {
+		t.Errorf("3 meterExporters should exist, however %v found.", len(allMeters.meters))
+	}
+	allMeters.lock.Unlock()
+
+	// Warm up the older entry
+	fakeClock.Step(90 * time.Second) //t+3m
+	//log.Printf("after step90")
+	//printAllMeters(allMeters.clock, fakeClock)
+
+	// Refresh the first entry
+	_, err = optionForResource(&resource123)
+	if err != nil {
+		t.Errorf("Should succeed getting option, instead got error %v", err)
+	}
+	// (123=0, 456=1.5m)
+	//log.Printf("After 123fetch")
+	//printAllMeters(allMeters.clock, fakeClock)
+
+	// Expire the second entry
+	fakeClock.Step(9 * time.Minute) // t+12m
+	// (123=9m, 456=10.5m)
+	//log.Printf("step 9min")
+	//printAllMeters(allMeters.clock, fakeClock)
+	allMeters.lock.Lock()
+	if len(allMeters.meters) != 2 {
+		printAllMeters(allMeters.clock, fakeClock)
+		t.Errorf("2 meterExporters should exist, however %v found.", len(allMeters.meters))
+	}
+	allMeters.lock.Unlock()
+	// The following output proves it is a race (notice that it fails but the counts are correct.
+	// means len(allMeters.meters) was 3 when evaluated in the conditional, but 2 when read for the error message)
+	//
+	// API server listening at: 127.0.0.1:26070
+	// 2020/09/29 22:05:49 Print allMeters.meters (clock 2020-09-29 22:17:49.318439432 +0000 UTC m=+721.774320360) (fakeClock 2020-09-29 22:17:49.318439432 +0000 UTC m=+721.774320360):
+	// 2020/09/29 22:05:49 -----------------------
+	// 2020/09/29 22:05:49 Key: foobarid456, time: 2020-09-29 22:08:49.318439432 +0000 UTC m=+181.774320360, age: 9m0s
+	// 2020/09/29 22:05:49 CurTime: 2020-09-29 22:17:49.318439432 +0000 UTC m=+721.774320360
+	// 2020/09/29 22:05:49 Pruning foobarid123: 12m0s (2020-09-29 22:17:49.318439432 +0000 UTC m=+721.774320360 - 2020-09-29 22:05:49.318439432 +0000 UTC m=+1.774320360)
+	// 2020/09/29 22:05:49 Key: , time: 2020-09-29 22:05:49.216162109 +0000 UTC m=+1.672042985, age: 12m0.102277375s
+	// 2020/09/29 22:05:49 Pruning foobarid456: 9m0s (2020-09-29 22:17:49.318439432 +0000 UTC m=+721.774320360 - 2020-09-29 22:08:49.318439432 +0000 UTC m=+181.774320360)
+	// 2020/09/29 22:05:49 Pruning : 12m0.102277375s (2020-09-29 22:17:49.318439432 +0000 UTC m=+721.774320360 - 2020-09-29 22:05:49.216162109 +0000 UTC m=+1.672042985)
+	// --- FAIL: TestAllMetersExpiration (0.00s)
+	// resource_view_test.go:217: 2 meterExporters should exist, however 2 found.
+
+	// non-expiring defaultMeter was just tested
+
+	allMeters.clock = origClock
 }
 
 func TestOptionForResource(t *testing.T) {
